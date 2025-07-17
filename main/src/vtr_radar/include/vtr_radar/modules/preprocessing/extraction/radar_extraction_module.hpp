@@ -40,10 +40,15 @@ class RadarExtractionModule : public tactic::BaseModule {
   struct Config : public BaseModule::Config {
     PTR_TYPEDEFS(Config);
 
-    std::string detector = "kstrongest";
-    double minr = 2;
-    double maxr = 100;
-
+    std::string detector = "kpeaks";
+    double minr = 1;
+    double maxr = 69;
+    // kpeaks
+    struct {
+      int kstrong = 4;
+      double threshold2 = 0.5;
+      double threshold3 = 0.22;
+    } kpeaks;
     // kstrongest
     struct {
       int kstrong = 10;
@@ -145,7 +150,8 @@ class RadarExtractionModule : public tactic::BaseModule {
     double radar_resolution = 0.0438;
     double range_offset = -0.31;
     double cart_resolution = 0.25;
-    double beta = 0.049;
+    double beta = 0.05;
+    bool upfront_range_corr = false;
 
     bool save_pointcloud_overlay = false;
     bool visualize = false;

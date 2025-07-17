@@ -35,12 +35,79 @@ bool sort_asc_by_second(const std::pair<int, float> &a,
 }
 
 } // namespace
+//  K-peaks implementation with scale correction due to range quantization errors
+template <class PointT>
+void KPeaks<PointT>::run(const cv::Mat &raw_scan, const float &res,
+                             const std::vector<int64_t> &azimuth_times,
+                             const std::vector<double> &azimuth_angles,
+                             const std::vector<bool> &up_chirps,
+                             pcl::PointCloud<PointT> &pointcloud) {
+  pointcloud.clear();
+  const int rows = raw_scan.rows;
+  const int cols = raw_scan.cols;
+  auto mincol = minr_ / res;
+  if (mincol > cols || mincol < 0) mincol = 0;
+  auto maxcol = maxr_ / res;
+  if (maxcol > cols || maxcol < 0) maxcol = cols;
+  for (int i = 0; i < rows; ++i) {
+    std::vector<std::pair<float, int>> intens;
+    const float thres = threshold3_;
+    // 1. Collect threshold-exceeding points (in column order)
+    for (int j = mincol; j < maxcol; ++j) {
+      if (raw_scan.at<float>(i, j) >= thres) {
+        intens.emplace_back(raw_scan.at<float>(i, j), j);
+      }
+    }
+    if (!intens.empty()) {
+      // 2. Group adjacent bins into peaks
+      std::vector<std::pair<float, std::vector<int>>> peaks;
+      float current_max = intens[0].first;
+      std::vector<int> current_bins = {intens[0].second};
+      for (size_t idx = 1; idx < intens.size(); ++idx) {
+        const int current_j = intens[idx].second;
+        if (current_j == current_bins.back() + 1) {
+          // Continuation of current peak
+          current_max = std::max(current_max, intens[idx].first);
+          current_bins.push_back(current_j);
+        } else {
+          // Finalize current peak
+          peaks.emplace_back(current_max, current_bins);
+          current_max = intens[idx].first;
+          current_bins = {current_j};
+        }
+      }
+      peaks.emplace_back(current_max, current_bins);  // Add last peak
+      // 3. Sort peaks by maximum intensity
+      std::sort(peaks.begin(), peaks.end(),
+               [](const auto& a, const auto& b) { return a.first > b.first; });
+      // 4. Select top-k peaks with averaged positions
+      const double azimuth = azimuth_angles[i];
+      const int64_t time = azimuth_times[i];
+      pcl::PointCloud<PointT> polar_time;
+      for (int p = 0; p < std::min(kstrong_, (int)peaks.size()); ++p) {
+        const auto& peak = peaks[p];
+        const float avg_j = std::accumulate(peak.second.begin(),
+                                           peak.second.end(), 0.0f)
+                           / peak.second.size();
+        PointT point;
+        point.rho = (avg_j * res) + static_cast<float>(range_offset_);
+        point.phi = azimuth;
+        point.theta = 0;
+        point.timestamp = time;
+        polar_time.push_back(point);
+      }
+      pointcloud.insert(pointcloud.end(), polar_time.begin(), polar_time.end());
+    }
+  }
+}
+
 
 // K-strongest implementation as per Elliot's paper
 template <class PointT>
 void KStrongest<PointT>::run(const cv::Mat &raw_scan, const float &res,
                              const std::vector<int64_t> &azimuth_times,
                              const std::vector<double> &azimuth_angles,
+                             const std::vector<bool> &up_chirps,
                              pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -70,6 +137,7 @@ void KStrongest<PointT>::run(const cv::Mat &raw_scan, const float &res,
 
       const double azimuth = azimuth_angles[i];
       const int64_t time = azimuth_times[i];
+      const bool up_chirp = up_chirps[i];
       pcl::PointCloud<PointT> polar_time;
       for (int j = 0; j < kstrong_; ++j) {
         if (j >= thresholded_point_count){break;}
@@ -78,6 +146,7 @@ void KStrongest<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
       }
       // #pragma omp critical
@@ -92,6 +161,7 @@ template <class PointT>
 void Cen2018<PointT>::run(const cv::Mat &raw_scan, const float &res,
                           const std::vector<int64_t> &azimuth_times,
                           const std::vector<double> &azimuth_angles,
+                          const std::vector<bool> &up_chirps,
                           pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -165,6 +235,7 @@ void Cen2018<PointT>::run(const cv::Mat &raw_scan, const float &res,
     const float thres = zq_ * sigma_q[i];
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     for (int j = mincol; j < maxcol; ++j) {
       const float nqp = exp(
           -0.5 * pow((q.at<float>(i, j) - p.at<float>(i, j)) / sigma_q[i], 2));
@@ -180,6 +251,7 @@ void Cen2018<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -197,6 +269,7 @@ template <class PointT>
 void OSCFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                          const std::vector<int64_t> &azimuth_times,
                          const std::vector<double> &azimuth_angles,
+                         const std::vector<bool> &up_chirps,
                          pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -218,6 +291,7 @@ void OSCFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
 
     std::vector<std::pair<int, float>> window;
@@ -272,6 +346,7 @@ void OSCFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -288,6 +363,7 @@ template <class PointT>
 void TM_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                          const std::vector<int64_t> &azimuth_times,
                          const std::vector<double> &azimuth_angles,
+                         const std::vector<bool> &up_chirps,
                          pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -309,6 +385,7 @@ void TM_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
 
     std::vector<std::pair<int, float>> window;
@@ -374,6 +451,7 @@ void TM_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -391,6 +469,7 @@ template <class PointT>
 void CACFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -411,6 +490,7 @@ void CACFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     float peak_points = 0;
     int num_peak_points = 0;
@@ -446,6 +526,7 @@ void CACFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -460,6 +541,7 @@ template <class PointT>
 void ModifiedCACFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -485,6 +567,7 @@ void ModifiedCACFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     double mean = 0;
     for (int j = mincol; j < maxcol; ++j) {
@@ -515,6 +598,7 @@ void ModifiedCACFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -528,6 +612,7 @@ template <class PointT>
 void CAGO_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -550,6 +635,7 @@ void CAGO_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     float peak_points = 0;
     int num_peak_points = 0;
@@ -585,6 +671,7 @@ void CAGO_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -599,6 +686,7 @@ template <class PointT>
 void CASO_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -621,6 +709,7 @@ void CASO_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     double mean = 0;
     float peak_points = 0;
@@ -655,6 +744,7 @@ void CASO_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -682,6 +772,7 @@ template <class PointT>
 void CFEAR_KStrong<PointT>::run(const cv::Mat &raw_scan, const float &res,
                              const std::vector<int64_t> &azimuth_times,
                              const std::vector<double> &azimuth_angles,
+                             const std::vector<bool> &up_chirps,
                              pcl::PointCloud<PointT> &pointcloud) {
 
   pointcloud.clear();
@@ -826,14 +917,18 @@ void CFEAR_KStrong<PointT>::run(const cv::Mat &raw_scan, const float &res,
       int64_t t1=0;
       int64_t t2=0;
       int64_t time=0;
+      bool up_chirp = true;
       if(index<=0){
         time = azimuth_times[0];
+        up_chirp = up_chirps[0];
       } else if(index >= rows-1){
         time = azimuth_times[rows-1];
+        up_chirp = up_chirps[rows-1];
       } else{
         t1 = azimuth_times[index];
         t2 = azimuth_times[index+1];
         time = t1 + (t2-t1)*(normalizedAngle-a1)/(a2-a1);
+        up_chirp = up_chirps[index];
       }
 
       PointT p;
@@ -841,7 +936,7 @@ void CFEAR_KStrong<PointT>::run(const cv::Mat &raw_scan, const float &res,
       p.phi = normalizedAngle;
       p.theta = 0;
       p.timestamp = time;
-
+      p.up_chirp = up_chirp;
       polar_time.push_back(p);
 
     }
@@ -856,6 +951,7 @@ template <class PointT>
 void BFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -883,6 +979,7 @@ void BFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     float peak_points = 0;
     int num_peak_points = 0;
@@ -921,6 +1018,7 @@ void BFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0.0;
         num_peak_points = 0;
@@ -934,6 +1032,7 @@ template <class PointT>
 void MSCA_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -955,6 +1054,7 @@ void MSCA_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     float peak_points = 0;
     int num_peak_points = 0;
@@ -987,6 +1087,7 @@ void MSCA_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -1000,6 +1101,7 @@ template <class PointT>
 void IS_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -1021,6 +1123,7 @@ void IS_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
 
     float peak_points = 0;
@@ -1076,6 +1179,7 @@ void IS_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -1090,6 +1194,7 @@ template <class PointT>
 void VI_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
   pointcloud.clear();
   const int rows = raw_scan.rows;
@@ -1110,6 +1215,7 @@ void VI_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for (int i = 0; i < rows; ++i) {
     const double azimuth = azimuth_angles[i];
     const int64_t time = azimuth_times[i];
+    const bool up_chirp = up_chirps[i];
     pcl::PointCloud<PointT> polar_time;
     float peak_points = 0;
     int num_peak_points = 0;
@@ -1180,6 +1286,7 @@ void VI_CFAR<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
         peak_points = 0;
         num_peak_points = 0;
@@ -1193,6 +1300,7 @@ template <class PointT>
 void Cen2019<PointT>::run(const cv::Mat &raw_scan, const float &res,
                                  const std::vector<int64_t> &azimuth_times,
                                  const std::vector<double> &azimuth_angles,
+                                 const std::vector<bool> &up_chirps,
                                  pcl::PointCloud<PointT> &pointcloud) {
 
                                   
@@ -1300,6 +1408,7 @@ void Cen2019<PointT>::run(const cv::Mat &raw_scan, const float &res,
   for(auto& [a,ranges] : Q_Map){
     const double azimuth = azimuth_angles[a];
     const int64_t time = azimuth_times[a];
+    const bool up_chirp = up_chirps[a];
     pcl::PointCloud<PointT> polar_time;
 
     // For every region in this azimuth
@@ -1332,6 +1441,7 @@ void Cen2019<PointT>::run(const cv::Mat &raw_scan, const float &res,
         p.phi = azimuth;
         p.theta = 0;
         p.timestamp = time;
+        p.up_chirp = up_chirp;
         polar_time.push_back(p);
       }
     }
